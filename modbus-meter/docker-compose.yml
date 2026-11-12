@@ -22,8 +22,18 @@ services:
       METER_PORT: "502"
       METER_SLAVE_ID: "1"
       METER_TIMEOUT: "3"
+      # 校时过程中的 SQLite / 结果 CSV 落盘目录（独立卷，不占容器内存）
+      CORRECTION_TMP_DIR: "/tmp/correction"
     ports:
       - "8000:8000"
+    # 厂务能耗库前置服务的硬约束：API 容器内存上限 192 MiB
+    mem_limit: 192m
+    mem_reservation: 128m
+    volumes:
+      - correction-tmp:/tmp/correction
     depends_on:
       meter:
         condition: service_healthy
+
+volumes:
+  correction-tmp:

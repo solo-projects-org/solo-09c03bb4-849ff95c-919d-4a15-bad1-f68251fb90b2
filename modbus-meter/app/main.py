@@ -1,20 +1,30 @@
-"""FastAPI：单台 Modbus TCP 电表试采接口。"""
+"""FastAPI：Modbus 电表试采与缓存读数校时接口。"""
 
 from __future__ import annotations
 
 import os
+import shutil
+import tempfile
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 from pymodbus.client import AsyncModbusTcpClient
 from pymodbus.exceptions import ModbusException
 
+from .correction import CorrectionError, run_correction
 from .planner import PlanError, Segment, plan_reads
 
 DEFAULT_HOST = os.getenv("METER_HOST", "meter")
 DEFAULT_PORT = int(os.getenv("METER_PORT", "502"))
 DEFAULT_SLAVE = int(os.getenv("METER_SLAVE_ID", "1"))
 DEFAULT_TIMEOUT = float(os.getenv("METER_TIMEOUT", "3"))
+# 校时临时 SQLite / 结果 CSV 与上传假脱机文件的落盘目录（容器内挂载专用卷）
+CORRECTION_TMP_DIR = os.getenv("CORRECTION_TMP_DIR", "/tmp/correction")
+# 单个上传文件大小上限（默认 256 MiB），超出直接拒绝，避免无限落盘
+MAX_UPLOAD_BYTES = int(os.getenv("CORRECTION_MAX_UPLOAD", str(256 * 1024 * 1024)))
+# 上传文件在内存中保留的最大字节数，超出即假脱机到磁盘
+SPOOL_THRESHOLD = 1 * 1024 * 1024
 
 
 class PointIn(BaseModel):
@@ -62,14 +72,17 @@ class ReadResponse(BaseModel):
 
 
 app = FastAPI(
-    title="Modbus TCP 电表试采接口",
-    version="1.0.0",
+    title="Modbus 电表试采与缓存读数校时接口",
+    version="1.1.0",
     description=(
-        "提交测点保持寄存器起始地址（从 0 算）与字数（1 或 2），"
-        "并给出设备可读区间（含两端）与单次读取上限。"
-        "接口先做读段规划（请求次数最少，次数相同则读取寄存器总数最少），"
-        "再逐段读取，返回读段与无符号计数（双字高字在前）。"
-        "无可行方案或读取失败时直接报错，不返回部分读数。"
+        "1. `POST /read`：提交测点保持寄存器起始地址（从 0 算）与字数"
+        "（1 或 2），并给出设备可读区间（含两端）与单次读取上限，"
+        "接口先规划读段（请求次数最少，次数相同则读取寄存器总数最少），"
+        "再逐段读取，返回读段与无符号计数（双字高字在前）。\n\n"
+        "2. `POST /correct`：上传同一网关的校时日志与缓存电表读数两份 CSV，"
+        "按同次启动相邻校时点（含端点）线性换算到 UTC 整秒；无法换算或"
+        "校正后同表同秒撞车（含跨启动）的读数标记为待核对，结果按读数"
+        "原序以 CSV 流式返回。遇坏行直接报错，不返回部分结果。"
     ),
 )
 
@@ -174,4 +187,111 @@ async def read_meter(req: ReadRequest) -> ReadResponse:
         total_registers=sum(s.count for s in segments),
         segments=seg_out,
         points=points_out,
+    )
+
+
+def _spool_upload(file: UploadFile) -> tempfile.SpooledTemporaryFile:
+    """流式读取上传文件：小文件留内存，超过阈值自动落盘到专用卷。
+
+    返回的假脱机文件已 seek 到起始位置，可直接按行流式解析；
+    调用方负责 close。超限抛出 422，不继续读取。
+    """
+    os.makedirs(CORRECTION_TMP_DIR, exist_ok=True)
+    spool = tempfile.SpooledTemporaryFile(
+        max_size=SPOOL_THRESHOLD,
+        mode="w+b",
+        dir=CORRECTION_TMP_DIR,
+        prefix=f"upload-{file.filename or ''}-",
+    )
+    total = 0
+    try:
+        while True:
+            chunk = file.file.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_UPLOAD_BYTES:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"文件 {file.filename} 超过上传大小上限 "
+                    f"{MAX_UPLOAD_BYTES} 字节",
+                )
+            spool.write(chunk)
+    except BaseException:
+        spool.close()
+        raise
+    spool.seek(0)
+    return spool
+
+
+@app.post(
+    "/correct",
+    summary="上传校时日志与缓存读数两份 CSV，输出校时后的结果 CSV",
+    responses={
+        200: {"content": {"text/csv": {}}, "description": "校时结果 CSV（按读数原序）"},
+        422: {"description": "坏行 / 约束不满足（含文件名与行号），不返回部分结果"},
+    },
+)
+def correct_meter_readings(
+    calibration: UploadFile = File(
+        ...,
+        description=(
+            "校时日志 CSV，表头 boot_id,boot_ms,utc_ms；"
+            "最多 1000 行，同启动两列均严格递增"
+        ),
+    ),
+    readings: UploadFile = File(
+        ...,
+        description=(
+            "缓存读数 CSV，表头 meter_id,boot_id,boot_ms,word_high,word_low；"
+            "最多 100 万行，可乱序；寄存器字为 16 位无符号值"
+        ),
+    ),
+) -> StreamingResponse:
+    cal_name = calibration.filename or "calibration.csv"
+    rd_name = readings.filename or "readings.csv"
+    cal_spool = _spool_upload(calibration)
+    try:
+        rd_spool = _spool_upload(readings)
+    except BaseException:
+        # 第二个文件假脱机失败（含超限）时，确保第一个也被清理
+        cal_spool.close()
+        raise
+
+    os.makedirs(CORRECTION_TMP_DIR, exist_ok=True)
+    tmp_dir: str | None = None
+    try:
+        try:
+            output_path = run_correction(
+                calibration=cal_spool,
+                readings=rd_spool,
+                calibration_filename=cal_name,
+                readings_filename=rd_name,
+                work_dir=CORRECTION_TMP_DIR,
+            )
+        except CorrectionError as exc:
+            # 坏行：run_correction 已清理临时目录，不产出部分结果
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        tmp_dir = os.path.dirname(output_path)
+    finally:
+        cal_spool.close()
+        rd_spool.close()
+
+    def iter_result():
+        try:
+            with open(output_path, "rb") as result:
+                while True:
+                    chunk = result.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return StreamingResponse(
+        iter_result(),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="corrected_readings.csv"'
+        },
     )
