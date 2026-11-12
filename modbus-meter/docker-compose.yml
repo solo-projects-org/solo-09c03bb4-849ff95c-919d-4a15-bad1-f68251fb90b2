@@ -24,6 +24,9 @@ services:
       METER_TIMEOUT: "3"
     ports:
       - "8000:8000"
+    # 校时全程磁盘流式处理，SQLite 页缓存限 8 MiB；容器硬上限 192 MiB
+    mem_limit: 192m
+    mem_reservation: 128m
     depends_on:
       meter:
         condition: service_healthy

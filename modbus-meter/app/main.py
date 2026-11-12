@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import os
+from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException
+from anyio import to_thread
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 from pymodbus.client import AsyncModbusTcpClient
 from pymodbus.exceptions import ModbusException
 
+from .correction import (
+    UTF8_BOM,
+    CorrectionError,
+    prepare_correction,
+)
 from .planner import PlanError, Segment, plan_reads
 
 DEFAULT_HOST = os.getenv("METER_HOST", "meter")
@@ -62,14 +70,20 @@ class ReadResponse(BaseModel):
 
 
 app = FastAPI(
-    title="Modbus TCP 电表试采接口",
-    version="1.0.0",
+    title="Modbus TCP 电表试采 / 缓存读数校时接口",
+    version="1.1.0",
     description=(
-        "提交测点保持寄存器起始地址（从 0 算）与字数（1 或 2），"
-        "并给出设备可读区间（含两端）与单次读取上限。"
-        "接口先做读段规划（请求次数最少，次数相同则读取寄存器总数最少），"
-        "再逐段读取，返回读段与无符号计数（双字高字在前）。"
-        "无可行方案或读取失败时直接报错，不返回部分读数。"
+        "两块能力：\n\n"
+        "1. `POST /read`：提交测点保持寄存器起始地址（从 0 算）与字数（1 或 2），"
+        "并给出设备可读区间（含两端）与单次读取上限。接口先做读段规划"
+        "（请求次数最少，次数相同则读取寄存器总数最少），再逐段读取，"
+        "返回读段与无符号计数（双字高字在前）。无可行方案或读取失败时直接报错，"
+        "不返回部分读数。\n\n"
+        "2. `POST /correct`：上传同一网关的读数 CSV 与校时日志 CSV，"
+        "按同次启动相邻校时点线性换算校时（向下取 UTC 整秒），"
+        "无法换算或校正后同表同秒撞秒（跨启动也算）的读数标为待核对，"
+        "按读数原序返回结果 CSV。坏行报文件名与行号，不返回部分结果；"
+        "最多 100 万条读数，全程磁盘流式处理，不把读数、撞秒索引或输出攒进内存。"
     ),
 )
 
@@ -174,4 +188,55 @@ async def read_meter(req: ReadRequest) -> ReadResponse:
         total_registers=sum(s.count for s in segments),
         segments=seg_out,
         points=points_out,
+    )
+
+
+@app.post(
+    "/correct",
+    summary="上传读数 CSV 与校时日志 CSV，对网关缓存电表读数校时",
+    responses={
+        200: {"content": {"text/csv; charset=utf-8": {}}},
+        422: {"description": "CSV 坏行 / 超行数上限（detail 含文件名与行号，不返回部分结果）"},
+    },
+)
+async def correct_readings(
+    readings: UploadFile = File(
+        ...,
+        description=(
+            "读数 CSV，表头：meter_id,boot_id,uptime_ms,word_high,word_low"
+            "（表号、启动编号、开机毫秒、两个 16 位无符号寄存器字）"
+        ),
+    ),
+    calibration: UploadFile = File(
+        ...,
+        description=(
+            "校时日志 CSV（最多 1000 行），表头：boot_id,uptime_ms,utc_ms；"
+            "同次启动内开机毫秒与 UTC 毫秒均严格递增"
+        ),
+    ),
+) -> StreamingResponse:
+    # 落盘、全量校验与撞秒标记都是同步磁盘/CPU 操作，放线程避免阻塞事件循环；
+    # 全部成功后才返回 StreamingResponse，任何坏行在这里就以 422 失败。
+    try:
+        job = await to_thread.run_sync(prepare_correction, readings, calibration)
+    except CorrectionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    def payload():
+        try:
+            yield UTF8_BOM
+            yield from job.stream()
+        finally:
+            job.close()
+
+    filename = "corrected_readings.csv"
+    return StreamingResponse(
+        payload(),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename=\"{filename}\"; "
+                f"filename*=UTF-8''{quote(filename)}"
+            )
+        },
     )
